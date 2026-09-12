@@ -12,6 +12,7 @@
 #   server    linux202.unoeuro.com
 #   webroot   /var/www/aiprojectinstitute.ai/public_html/
 #   rsync     present at /usr/bin/rsync
+#   sha256sum present at /usr/bin/sha256sum  (openssl also present; 12/09/2026)
 #
 # Secrets required (set with `gh secret set`, never committed):
 #   SSH_PRIVATE_KEY  deploy key private half
@@ -70,17 +71,47 @@ jobs:
       # safe. Turn it on only after one clean deploy has proven the path,
       # and re-inventory the server before doing so.
 
+      # Compares SHA-256, not just length: a different file of the same size
+      # passes a byte-count check (gap found in the WP-23 rollback test,
+      # 12/09/2026). Byte counts are still logged for readability.
       - name: Verify — file on server matches the repo
         run: |
-          REMOTE_BYTES=$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+          LOCAL_SHA=$(sha256sum site/index.html | awk '{print $1}')
+          echo "index.html in repo:   $LOCAL_BYTES bytes  sha256 $LOCAL_SHA"
+
+          # One SSH round trip. The server prefers sha256sum and falls back to
+          # openssl if it is missing; it prints "bytes", "tool" and "sha256" lines.
+          REMOTE=$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
             "${{ secrets.SSH_USER }}@ssh.simply.com" \
-            "wc -c < ${WEBROOT}index.html" | tr -d '[:space:]')
-          echo "index.html on server: $REMOTE_BYTES bytes"
-          if [ "$REMOTE_BYTES" != "$LOCAL_BYTES" ]; then
-            echo "::error::Byte mismatch. Repo $LOCAL_BYTES, server $REMOTE_BYTES."
+            sh -s -- "${WEBROOT}index.html" <<'EOF'
+          f="$1"
+          echo "bytes $(wc -c < "$f")"
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "tool sha256sum"
+            echo "sha256 $(sha256sum < "$f" | awk '{print $1}')"
+          elif command -v openssl >/dev/null 2>&1; then
+            echo "tool openssl"
+            echo "sha256 $(openssl dgst -sha256 < "$f" | awk '{print $NF}')"
+          else
+            echo "tool none"
+          fi
+          EOF
+          )
+          REMOTE_BYTES=$(printf '%s\n' "$REMOTE" | awk '$1=="bytes"{print $2}')
+          REMOTE_TOOL=$(printf '%s\n' "$REMOTE" | awk '$1=="tool"{print $2}')
+          REMOTE_SHA=$(printf '%s\n' "$REMOTE" | awk '$1=="sha256"{print $2}')
+          echo "index.html on server: $REMOTE_BYTES bytes  sha256 $REMOTE_SHA  (via $REMOTE_TOOL)"
+
+          if ! printf '%s' "$REMOTE_SHA" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "::error::Could not read a SHA-256 for index.html from the server (tool: ${REMOTE_TOOL:-unknown}). Server output:"
+            printf '%s\n' "$REMOTE"
             exit 1
           fi
-          echo "Byte-identical. Deployed file matches the repository."
+          if [ "$REMOTE_SHA" != "$LOCAL_SHA" ]; then
+            echo "::error::SHA-256 mismatch. Repo $LOCAL_SHA ($LOCAL_BYTES bytes), server $REMOTE_SHA ($REMOTE_BYTES bytes)."
+            exit 1
+          fi
+          echo "SHA-256 identical. Deployed file matches the repository."
 
       - name: Verify — live site responds (advisory only)
         continue-on-error: true

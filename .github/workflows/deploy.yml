@@ -1,0 +1,98 @@
+# .github/workflows/deploy.yml
+#
+# AI Project Institute — deploy apinst-web to Simply.com (WP-20)
+#
+# Fires on merge to main. Also manually triggerable, so the live site can be
+# re-synced from main without a commit — the recovery path if server and repo
+# ever diverge.
+#
+# Verified environment (17/08/2026 and 12/09/2026):
+#   host      ssh.simply.com          port 22
+#   user      aiprojectinstit.ai      (NOT derivable from the domain)
+#   server    linux202.unoeuro.com
+#   webroot   /var/www/aiprojectinstitute.ai/public_html/
+#   rsync     present at /usr/bin/rsync
+#
+# Secrets required (set with `gh secret set`, never committed):
+#   SSH_PRIVATE_KEY  deploy key private half
+#   SSH_USER         aiprojectinstit.ai
+
+name: Deploy to Simply.com
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  WEBROOT: /var/www/aiprojectinstitute.ai/public_html/
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Pre-flight — refuse to deploy an empty or missing index
+        run: |
+          if [ ! -s site/index.html ]; then
+            echo "::error::site/index.html missing or empty. Refusing to deploy."
+            exit 1
+          fi
+          LOCAL_BYTES=$(wc -c < site/index.html)
+          echo "LOCAL_BYTES=$LOCAL_BYTES" >> "$GITHUB_ENV"
+          echo "index.html in repo: $LOCAL_BYTES bytes"
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ssh.simply.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Deploy
+        run: |
+          rsync -avz --checksum \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes" \
+            ./site/ \
+            "${{ secrets.SSH_USER }}@ssh.simply.com:${WEBROOT}"
+
+      # --delete is deliberately OFF for the first deploys.
+      # The server inventory on 12/09/2026 showed public_html contains only
+      # index.html and .htaccess, both now in the repo — so --delete would be
+      # safe. Turn it on only after one clean deploy has proven the path,
+      # and re-inventory the server before doing so.
+
+      - name: Verify — file on server matches the repo
+        run: |
+          REMOTE_BYTES=$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+            "${{ secrets.SSH_USER }}@ssh.simply.com" \
+            "wc -c < ${WEBROOT}index.html" | tr -d '[:space:]')
+          echo "index.html on server: $REMOTE_BYTES bytes"
+          if [ "$REMOTE_BYTES" != "$LOCAL_BYTES" ]; then
+            echo "::error::Byte mismatch. Repo $LOCAL_BYTES, server $REMOTE_BYTES."
+            exit 1
+          fi
+          echo "Byte-identical. Deployed file matches the repository."
+
+      - name: Verify — live site responds with expected content
+        run: |
+          sleep 5
+          CODE=$(curl -fsS -o /tmp/live.html -w '%{http_code}' https://aiprojectinstitute.ai)
+          echo "HTTP $CODE"
+          if ! grep -qi "AI Project Institute" /tmp/live.html; then
+            echo "::error::Live page did not contain expected content. Check immediately."
+            exit 1
+          fi
+          echo "Live site verified."
+
+      - name: Remove deploy key from runner
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
